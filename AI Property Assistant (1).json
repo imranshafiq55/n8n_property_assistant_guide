@@ -1,0 +1,673 @@
+{
+  "name": "AI Property Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "property-chat-v1",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -912,
+        208
+      ],
+      "id": "ff5eeca7-0b07-41e8-a5c6-2b257dcef167",
+      "name": "Webhook",
+      "webhookId": "a7268595-4024-4e0a-aa6a-d80a17ea64e3"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE 1 — LOAD STATE\n// Position: Right after Webhook node\n// Purpose: Read persistent memory & pass context to AI Agent\n// ============================================================\n\n// Temporary: Clear polluted state\n//$getWorkflowStaticData('global').conversationState = null;\n\n\nconst staticData = $getWorkflowStaticData('global');\n\n// ============================================================\n// STEP 1 — READ RAW WEBHOOK INPUT\n// ============================================================\n\nconst rawJson         = $input.first()?.json || {};\nconst incomingMessage = (\n  rawJson?.body?.message ||\n  rawJson?.message       ||\n  ''\n).trim();\n\n// ── Guard: empty message ──\nif (!incomingMessage) {\n  return [{\n    json: {\n      error: true,\n      reply: \"I didn't receive a message. Please type something and try again.\",\n      _debug: {\n        rawJson,\n        reason: 'incomingMessage was empty after checking both paths'\n      }\n    }\n  }];\n}\n\n// ============================================================\n// STEP 2 — SESSION EXPIRY CHECK\n// THIS IS THE KEY FIX.\n// Even if conversationState exists from a previous session,\n// we check how old the session is. If older than 30 minutes\n// of inactivity, we treat it as a brand new session and\n// wipe everything — state AND cache.\n// This prevents old city/price/type bleeding into new chats.\n// ============================================================\n\nconst SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes\nconst now                = Date.now();\nconst lastActivity       = staticData.lastActivityAt\n                             ? new Date(staticData.lastActivityAt).getTime()\n                             : null;\n\nconst isSessionExpired = !lastActivity ||\n                         (now - lastActivity) > SESSION_TIMEOUT_MS;\n\nif (isSessionExpired && staticData.conversationState) {\n  // Session timed out — wipe everything cleanly\n  staticData.conversationState   = null;\n  staticData.cache               = {};\n  staticData.sessionMessageCount = 0;\n  staticData.sessionStart        = null;\n}\n\n// ── Update last activity timestamp on EVERY message ──\n// This is what keeps an active session alive\nstaticData.lastActivityAt = new Date(now).toISOString();\n\n// ============================================================\n// STEP 3 — DETECT MANUAL RESET REQUEST\n// ============================================================\n\nconst RESET_TRIGGERS = ['reset', 'start over', 'new search', 'clear', 'restart'];\nconst isResetRequest = RESET_TRIGGERS.some(trigger =>\n  incomingMessage.toLowerCase().includes(trigger)\n);\n\nif (isResetRequest) {\n  staticData.conversationState   = {\n    property_type: null,\n    min_price:     null,\n    max_price:     null,\n    city:          null,\n    state:         null,\n    availability:  null,\n    bedrooms:      null\n  };\n  staticData.cache               = {};\n  staticData.sessionStart        = new Date().toISOString();\n  staticData.sessionMessageCount = 0;\n  staticData.lastActivityAt      = new Date(now).toISOString();\n\n  return [{\n    json: {\n      message:             incomingMessage,\n      currentState:        staticData.conversationState,\n      contextSummary:      'The user has started a fresh search. No preferences collected yet.',\n      sessionMessageCount: 0,\n      isFirstMessage:      true,\n      wasReset:            true\n    }\n  }];\n}\n\n// ============================================================\n// STEP 4 — INITIALIZE STATE\n// Runs when:\n//   a) Very first message ever\n//   b) Session just expired and we nulled the state above\n//   c) Workflow was redeployed\n// In ALL cases — cache is wiped and session resets cleanly.\n// ============================================================\n\nif (!staticData.conversationState) {\n  // Wipe cache first — before anything else\n  staticData.cache               = {};\n  staticData.sessionMessageCount = 0;\n  staticData.sessionStart        = new Date().toISOString();\n\n  staticData.conversationState = {\n    property_type: null,\n    min_price:     null,\n    max_price:     null,\n    city:          null,\n    state:         null,\n    availability:  null,\n    bedrooms:      null\n  };\n}\n\n// ── Defensive initializations ──\nif (!staticData.cache)        staticData.cache        = {};\nif (!staticData.sessionStart) staticData.sessionStart = new Date().toISOString();\n\n// ============================================================\n// STEP 5 — MESSAGE COUNTERS\n// ============================================================\n\nif (!staticData.totalMessageCount)   staticData.totalMessageCount   = 0;\nif (!staticData.sessionMessageCount) staticData.sessionMessageCount = 0;\n\nstaticData.totalMessageCount   += 1;\nstaticData.sessionMessageCount += 1;\n\nconst isFirstMessage = staticData.sessionMessageCount === 1;\n\n// ============================================================\n// STEP 6 — BUILD CONTEXT SUMMARY\n// ============================================================\n\nconst s         = staticData.conversationState;\nconst knownInfo = [];\n\nif (s.property_type && typeof s.property_type === 'string') {\n  knownInfo.push(`property type: ${s.property_type}`);\n}\nif (s.city && typeof s.city === 'string') {\n  knownInfo.push(`city: ${s.city}`);\n}\nif (s.state && typeof s.state === 'string') {\n  knownInfo.push(`state/province: ${s.state}`);\n}\nif (s.min_price !== null && s.min_price !== undefined) {\n  knownInfo.push(`minimum price: $${Number(s.min_price).toLocaleString()}`);\n}\nif (s.max_price !== null && s.max_price !== undefined) {\n  knownInfo.push(`maximum price: $${Number(s.max_price).toLocaleString()}`);\n}\nif (s.bedrooms !== null && s.bedrooms !== undefined) {\n  knownInfo.push(\n    s.bedrooms === 0\n      ? 'looking for a studio (0 bedrooms)'\n      : `bedrooms: ${s.bedrooms}`\n  );\n}\nif (s.availability === true) {\n  knownInfo.push('availability: available listings only');\n} else if (s.availability === false) {\n  knownInfo.push('availability: all listings including unavailable');\n}\n\nconst contextSummary = knownInfo.length > 0\n  ? `So far the user has told us: ${knownInfo.join(', ')}.`\n  : 'This is the first message — no preferences collected yet.';\n\n// ============================================================\n// STEP 7 — RETURN\n// ============================================================\n\nreturn [{\n  json: {\n    message:             incomingMessage,\n    currentState:        staticData.conversationState,\n    contextSummary:      contextSummary,\n    sessionMessageCount: staticData.sessionMessageCount,\n    totalMessageCount:   staticData.totalMessageCount,\n    isFirstMessage:      isFirstMessage,\n    sessionStart:        staticData.sessionStart,\n    wasReset:            false,\n    _debug: {\n      inputPathUsed:    rawJson?.body?.message\n                          ? 'json.body.message'\n                          : 'json.message',\n      sessionExpired:   isSessionExpired,\n      lastActivityAt:   lastActivity\n                          ? new Date(lastActivity).toISOString()\n                          : 'never',\n      idleMinutes:      lastActivity\n                          ? Math.round((now - lastActivity) / 60000)\n                          : null,\n      knownFieldCount:  knownInfo.length,\n      cacheKeys:        Object.keys(staticData.cache || {}),\n      rawInputKeys:     Object.keys(rawJson)\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -704,
+        208
+      ],
+      "id": "4c34cff7-4c9c-401a-9d9a-a72c180299ef",
+      "name": "Load State"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Webhook').item.json.body.message }}",
+        "options": {
+          "systemMessage": "=You are a smart and helpful Real Estate Assistant for SmushLabs Property Finder.\n\n### STATE PERSISTENCE RULE (Very Important)\n- You are given the \"Current conversation state\" below. Treat it as the source of truth.\n- Carry forward all existing values in your \"updatedState\" unless the user explicitly wants to change them.\n- Do NOT ask again for information that already exists in the state.\n\nCurrent conversation state:\n{{ JSON.stringify($json.currentState) }}\n\nUser's latest message: \"{{ $json.originalMessage }}\"\n\n### CORE RULES:\n\n1. **Extract & Update State**\n   - Carefully extract: property_type, city, min_price, max_price, bedrooms, area from the user's message.\n   - Merge with existing state. Only update fields that are clearly mentioned or changed.\n\n2. **Action Decision (Strict Logic)**\n   - If both `city` AND `property_type` are present in the final merged state → set `\"action\": \"DB_SEARCH\"`\n   - If weather is requested (words like weather, forecast, temperature, raining, climate) → set `\"action\": \"WEATHER_QUERY\"`\n   - Otherwise → set `\"action\": \"RESPOND\"`\n\n3. **Special Property Type Handling**\n   - \"house\" or \"home\" → Do **not** set property_type. Ask user to choose between Apartment, Villa, or Studio.\n   - \"studio apartment\" or \"studio\" → property_type: \"Studio\"\n   - Any mention of \"apartment\", \"flat\" → property_type: \"Apartment\"\n   - \"villa\" → property_type: \"Villa\"\n\n4. **Price Parsing**\n   - Support: \"2k\", \"40 lac\", \"50 lakh\", \"under 5000\", \"between 2k and 5k\", \"around 3000\", etc.\n   - Convert to numbers only (no strings).\n\n5. **Weather Handling**\n   - If user asks about weather in a city → set action = \"WEATHER_QUERY\" and return `city_for_weather`\n\n6. **Response Style**\n   - Be natural, polite, and concise.\n   - If doing DB_SEARCH, friendly_message should be something like: \"Searching for {{property_type}}s in {{city}} for you...\"\n   - Never return empty friendly_message.\n\n### RESPONSE FORMAT\nYou must respond with **ONLY** valid JSON in this exact structure:\n\n```json\n{\n  \"action\": \"DB_SEARCH\" | \"WEATHER_QUERY\" | \"RESPOND\",\n  \"updatedState\": {\n    \"property_type\": \"Apartment\" | \"Villa\" | \"Studio\" | \"House\" | null,\n    \"city\": \"string | null\",\n    \"min_price\": number | null,\n    \"max_price\": number | null,\n    \"bedrooms\": number | null,\n    \"area\": \"string | null\"\n  },\n  \"city_for_weather\": \"string | null\",\n  \"friendly_message\": \"Your natural reply to the user\",\n  \"missing_info\": \"string | null\"\n}"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -496,
+        208
+      ],
+      "id": "96a3d73f-6173-480e-99e2-248bad013c2f",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "RESPOND",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "c2f2d48c-01fb-4225-845c-b660aaee1a36"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "339ecb8f-e036-4904-b91a-7f136a161baa",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "WEATHER_QUERY",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a8b7cfc8-d15e-41bd-8ffb-21d70509c7cc",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "DB_SEARCH",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        128,
+        192
+      ],
+      "id": "3b421d7f-5b44-47b9-9c90-2efd43454de7",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE 2 — PARSE AI + SAVE STATE\n// Position: Right after AI Agent node\n// Purpose: Parse AI response → validate → save to memory → route\n// ============================================================\n\nconst staticData = $getWorkflowStaticData('global');\nconst rawAIOutput = $input.first()?.json?.text || $input.first()?.json?.output || '';\n\n// ============================================================\n// HELPER FUNCTIONS\n// ============================================================\n\n// ── Extracts JSON from AI text even if wrapped in markdown ──\nfunction extractJSON(text) {\n  if (!text || typeof text !== 'string') return null;\n\n  // Try 1: Direct parse (AI returned clean JSON)\n  try {\n    return JSON.parse(text.trim());\n  } catch (_) {}\n\n  // Try 2: Extract from ```json ... ``` markdown block\n  const mdMatch = text.match(/```json\\s*([\\s\\S]*?)\\s*```/i);\n  if (mdMatch) {\n    try { return JSON.parse(mdMatch[1].trim()); } catch (_) {}\n  }\n\n  // Try 3: Extract from ``` ... ``` (no language tag)\n  const codeMatch = text.match(/```\\s*([\\s\\S]*?)\\s*```/);\n  if (codeMatch) {\n    try { return JSON.parse(codeMatch[1].trim()); } catch (_) {}\n  }\n\n  // Try 4: Find first { ... } block in the text\n  const braceMatch = text.match(/\\{[\\s\\S]*\\}/);\n  if (braceMatch) {\n    try { return JSON.parse(braceMatch[0]); } catch (_) {}\n  }\n\n  // Try 5: Find last { ... } block (AI sometimes adds text after JSON)\n  const allBraces = [...text.matchAll(/\\{[\\s\\S]*?\\}/g)];\n  for (let i = allBraces.length - 1; i >= 0; i--) {\n    try { return JSON.parse(allBraces[i][0]); } catch (_) {}\n  }\n\n  return null;\n}\n\n// ── Validates the action field ──\nfunction validateAction(action) {\n  const valid = ['DB_SEARCH', 'WEATHER_QUERY', 'RESPOND'];\n  if (!action || typeof action !== 'string') return 'RESPOND';\n  return valid.includes(action.toUpperCase())\n    ? action.toUpperCase()\n    : 'RESPOND';\n}\n\n// ── Validates and cleans a state object ──\nfunction validateState(incoming, existing) {\n  const clean = {\n    property_type: null,\n    min_price:     null,\n    max_price:     null,\n    city:          null,\n    state:         null,\n    availability:  null,\n    bedrooms:      null\n  };\n\n  // Merge: use existing as base, overlay incoming on top\n  const merged = { ...clean, ...existing, ...incoming };\n\n  // ── property_type: must be a non-empty string ──\n  if (merged.property_type && typeof merged.property_type === 'string') {\n    clean.property_type = merged.property_type.trim() || null;\n  }\n\n  // ── city: must be a non-empty string ──\n  if (merged.city && typeof merged.city === 'string') {\n    clean.city = merged.city.trim() || null;\n  }\n\n  // ── state: must be a non-empty string ──\n  if (merged.state && typeof merged.state === 'string') {\n    clean.state = merged.state.trim() || null;\n  }\n\n  // ── min_price: must be a positive number ──\n  if (merged.min_price !== null && merged.min_price !== undefined) {\n    const val = Number(merged.min_price);\n    if (!isNaN(val) && val >= 0) clean.min_price = val;\n  }\n\n  // ── max_price: must be a positive number ──\n  if (merged.max_price !== null && merged.max_price !== undefined) {\n    const val = Number(merged.max_price);\n    if (!isNaN(val) && val >= 0) clean.max_price = val;\n  }\n\n  // ── price sanity check: min must not exceed max ──\n  if (clean.min_price !== null && clean.max_price !== null) {\n    if (clean.min_price > clean.max_price) {\n      // Swap them silently rather than rejecting\n      [clean.min_price, clean.max_price] = [clean.max_price, clean.min_price];\n    }\n  }\n\n  // ── bedrooms: must be a whole non-negative number ──\n  if (merged.bedrooms !== null && merged.bedrooms !== undefined) {\n    const val = parseInt(merged.bedrooms, 10);\n    if (!isNaN(val) && val >= 0) clean.bedrooms = val;\n  }\n\n  // ── availability: must be a boolean ──\n  if (merged.availability !== null && merged.availability !== undefined) {\n    if (typeof merged.availability === 'boolean') {\n      clean.availability = merged.availability;\n    } else if (merged.availability === 'true' || merged.availability === true) {\n      clean.availability = true;\n    } else if (merged.availability === 'false' || merged.availability === false) {\n      clean.availability = false;\n    }\n  }\n\n  return clean;\n}\n\n// ── Detects if the city changed between old and new state ──\nfunction cityChanged(oldState, newState) {\n  const oldCity = (oldState?.city || '').toLowerCase().trim();\n  const newCity = (newState?.city || '').toLowerCase().trim();\n  return oldCity !== newCity && newCity !== '';\n}\n\n// ── Detects if property_type changed ──\nfunction propertyTypeChanged(oldState, newState) {\n  const oldType = (oldState?.property_type || '').toLowerCase().trim();\n  const newType = (newState?.property_type || '').toLowerCase().trim();\n  return oldType !== newType && newType !== '';\n}\n\n// ── Invalidates cache when city or property_type changes ──\nfunction handleCacheInvalidation(oldState, newState) {\n  if (!staticData.cache) return;\n\n  const oldKey = `${(oldState?.city || '').toLowerCase().trim()}_${(oldState?.property_type || '').toLowerCase().trim()}`;\n\n  if (cityChanged(oldState, newState) || propertyTypeChanged(oldState, newState)) {\n    if (staticData.cache[oldKey]) {\n      delete staticData.cache[oldKey];\n    }\n  }\n}\n\n// ============================================================\n// MAIN LOGIC\n// ============================================================\n\nconst existingState = staticData.conversationState || {};\nlet aiResponse = null;\nlet parseError = null;\n\n// ── Attempt to parse the AI's output ──\nif (rawAIOutput) {\n  aiResponse = extractJSON(rawAIOutput);\n  if (!aiResponse) {\n    parseError = 'Could not extract valid JSON from AI response';\n  }\n} else {\n  parseError = 'AI returned empty output';\n}\n\n// ── If parsing completely failed, return safe fallback ──\nif (!aiResponse || parseError) {\n  return [{\n    json: {\n      action:          'RESPOND',\n      updatedState:    existingState,\n      friendly_message: \"Sorry, I didn't quite catch that. Could you rephrase?\",\n      city_for_weather: null,\n      missing_info:    null,\n      _debug: {\n        parseError,\n        rawLength: rawAIOutput?.length || 0\n      }\n    }\n  }];\n}\n\n// ── Validate action field ──\nconst action = validateAction(aiResponse.action);\n\n// ── Validate and clean the updated state ──\nconst incomingState = aiResponse.updatedState || aiResponse.updated_state || {};\nconst validatedState = validateState(incomingState, existingState);\n\n// ── Handle cache invalidation before saving new state ──\nhandleCacheInvalidation(existingState, validatedState);\n\n// ── Save the clean, validated state to persistent memory ──\nstaticData.conversationState = validatedState;\n\n// ── Save a log of the last action (helpful for debugging) ──\nstaticData.lastAction = action;\nstaticData.lastUpdated = new Date().toISOString();\n\n// ── Validate weather city ──\nconst cityForWeather = \n  typeof aiResponse.city_for_weather === 'string' && aiResponse.city_for_weather.trim()\n    ? aiResponse.city_for_weather.trim()\n    : (action === 'WEATHER_QUERY' ? validatedState.city : null);\n\n// ── Final safety check: DB_SEARCH requires property_type ──\nlet finalAction = action;\nif (action === 'DB_SEARCH' && !validatedState.property_type) {\n  finalAction = 'RESPOND';\n  aiResponse.friendly_message =\n    aiResponse.friendly_message ||\n    \"I'd love to help! Could you tell me what type of property you're looking for? For example: Apartment, Studio, or Villa.\";\n}\n\n// ── Return the fully validated, clean response ──\nreturn [{\n  json: {\n    action:           finalAction,\n    updatedState:     validatedState,\n    friendly_message: aiResponse.friendly_message || aiResponse.message || null,\n    city_for_weather: cityForWeather,\n    missing_info:     aiResponse.missing_info || null,\n    _debug: {\n      originalAction:  action,\n      finalAction:     finalAction,\n      parseSuccess:    true,\n      stateChanged:    JSON.stringify(existingState) !== JSON.stringify(validatedState),\n      cityChanged:     cityChanged(existingState, validatedState),\n      typeChanged:     propertyTypeChanged(existingState, validatedState),\n      timestamp:       staticData.lastUpdated\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        208
+      ],
+      "id": "ff37575c-04cf-4802-82aa-c4a3c467ab07",
+      "name": "Parse AI + Save State"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ff081d66-cee0-472f-bd78-cf383866605c",
+              "leftValue": "={{ $node[\"Parse AI + Save State\"].json.updatedState.property_type }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "bec9b101-446e-4d3a-8b9e-f0f5db42bde4",
+              "leftValue": "={{ $node[\"Parse AI + Save State\"].json.updatedState.city }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        640,
+        160
+      ],
+      "id": "27d5f6b1-a1bd-45dd-b818-5968f79d2c54",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE 3 — CHECK CACHE\n// Position: After \"Parse AI + Save State\", Before Switch node\n// Purpose: Check if we already have results for this \n//          city + property_type combo → skip DB if we do\n// ============================================================\n\nconst staticData = $getWorkflowStaticData('global');\nconst input = $input.first()?.json;\n\n// ============================================================\n// HELPER FUNCTIONS\n// ============================================================\n\n// ── Builds a normalized, consistent cache key ──\nfunction buildCacheKey(city, propertyType) {\n  const safeCity = (city || '').toLowerCase().trim().replace(/\\s+/g, '_');\n  const safeType = (propertyType || '').toLowerCase().trim().replace(/\\s+/g, '_');\n\n  // Both must exist for a valid key\n  if (!safeCity || !safeType) return null;\n\n  return `${safeCity}__${safeType}`;\n}\n\n// ── Checks if a cache entry is still fresh (under 30 mins) ──\nfunction isCacheFresh(cacheEntry) {\n  if (!cacheEntry || !cacheEntry.cachedAt) return false;\n\n  const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes\n  const age = Date.now() - new Date(cacheEntry.cachedAt).getTime();\n  return age < CACHE_TTL_MS;\n}\n\n// ── Applies price + bedroom filters on cached results ──\nfunction applyFilters(results, state) {\n  if (!Array.isArray(results)) return [];\n\n  let filtered = [...results];\n\n  // Price filters\n  if (state.min_price !== null && state.min_price !== undefined) {\n    filtered = filtered.filter(p => Number(p.price) >= Number(state.min_price));\n  }\n  if (state.max_price !== null && state.max_price !== undefined) {\n    filtered = filtered.filter(p => Number(p.price) <= Number(state.max_price));\n  }\n\n  // Bedroom filter\n  if (state.bedrooms !== null && state.bedrooms !== undefined) {\n    filtered = filtered.filter(p => Number(p.bedrooms) === Number(state.bedrooms));\n  }\n\n  // Availability filter\n  if (state.availability !== null && state.availability !== undefined) {\n    filtered = filtered.filter(p => p.availability === state.availability);\n  }\n\n  return filtered;\n}\n\n// ── Summarises what filters are active (for debug) ──\nfunction describeFilters(state) {\n  const active = [];\n  if (state.min_price) active.push(`min $${state.min_price}`);\n  if (state.max_price) active.push(`max $${state.max_price}`);\n  if (state.bedrooms)  active.push(`${state.bedrooms} beds`);\n  if (state.availability !== null) active.push(`available: ${state.availability}`);\n  return active.length > 0 ? active.join(', ') : 'none';\n}\n\n// ============================================================\n// GUARD: If action is not DB_SEARCH, pass straight through\n// ============================================================\n\n// This node only makes sense for DB_SEARCH actions.\n// WEATHER_QUERY and RESPOND should never reach here,\n// but if they do (mis-wiring), pass them through safely.\nif (!input) {\n  return [{\n    json: {\n      action: 'RESPOND',\n      updatedState: staticData.conversationState || {},\n      friendly_message: 'Something went wrong reading your request. Please try again.',\n      fromCache: false,\n      cacheKey: null,\n      results: null,\n      _debug: { error: 'No input received in Check Cache node' }\n    }\n  }];\n}\n\nconst action      = input.action;\nconst state       = input.updatedState || staticData.conversationState || {};\nconst friendlyMsg = input.friendly_message;\nconst missingInfo = input.missing_info;\n\n// Pass non-DB_SEARCH actions straight through untouched\nif (action !== 'DB_SEARCH') {\n  return [{\n    json: {\n      ...input,\n      fromCache: false,\n      cacheKey: null,\n      results: null,\n      _debug: {\n        skippedCache: true,\n        reason: `Action is ${action}, cache only applies to DB_SEARCH`\n      }\n    }\n  }];\n}\n\n// ============================================================\n// GUARD: property_type is mandatory before any cache/DB check\n// ============================================================\n\nif (!state.property_type) {\n  return [{\n    json: {\n      action: 'RESPOND',\n      updatedState: state,\n      friendly_message: friendlyMsg ||\n        \"What type of property are you looking for? For example: Apartment, Studio, or Villa.\",\n      fromCache: false,\n      cacheKey: null,\n      results: null,\n      _debug: {\n        blockedReason: 'property_type missing — cannot build cache key or query DB'\n      }\n    }\n  }];\n}\n\n// ============================================================\n// BUILD CACHE KEY\n// ============================================================\n\nconst cacheKey = buildCacheKey(state.city, state.property_type);\n\n// If city is missing we can't build a key — let DB handle it\nif (!cacheKey) {\n  return [{\n    json: {\n      action:           'DB_SEARCH',\n      updatedState:     state,\n      friendly_message: friendlyMsg,\n      missing_info:     missingInfo,\n      fromCache:        false,\n      cacheKey:         null,\n      results:          null,\n      _debug: {\n        cacheMiss: true,\n        reason: 'Could not build cache key — city may be missing',\n        city: state.city,\n        property_type: state.property_type\n      }\n    }\n  }];\n}\n\n// ============================================================\n// CACHE LOOKUP\n// ============================================================\n\nconst cache      = staticData.cache || {};\nconst cacheEntry = cache[cacheKey];\n\n// ── CACHE HIT ──\nif (cacheEntry && isCacheFresh(cacheEntry)) {\n  const allCachedResults = cacheEntry.results || [];\n\n  // Re-apply filters on cached results\n  // (user may have changed price/bedrooms since last fetch)\n  const filteredResults = applyFilters(allCachedResults, state);\n  const top3            = filteredResults.slice(0, 3);\n\n  return [{\n    json: {\n      action:           'DB_SEARCH',\n      updatedState:     state,\n      friendly_message: friendlyMsg,\n      missing_info:     missingInfo,\n      fromCache:        true,\n      cacheKey:         cacheKey,\n      results:          top3,\n      _debug: {\n        cacheHit:           true,\n        cacheKey:           cacheKey,\n        cachedAt:           cacheEntry.cachedAt,\n        totalCachedResults: allCachedResults.length,\n        afterFilters:       filteredResults.length,\n        returning:          top3.length,\n        filtersApplied:     describeFilters(state),\n        ageSeconds:         Math.round(\n          (Date.now() - new Date(cacheEntry.cachedAt).getTime()) / 1000\n        )\n      }\n    }\n  }];\n}\n\n// ── CACHE MISS (expired or never cached) ──\nconst missReason = cacheEntry && !isCacheFresh(cacheEntry)\n  ? 'Cache expired (older than 30 minutes)'\n  : 'No cache entry found for this city + property type';\n\n// Clean up stale entry if it exists\nif (cacheEntry) {\n  delete staticData.cache[cacheKey];\n}\n\nreturn [{\n  json: {\n    action:           'DB_SEARCH',\n    updatedState:     state,\n    friendly_message: friendlyMsg,\n    missing_info:     missingInfo,\n    fromCache:        false,\n    cacheKey:         cacheKey,\n    results:          null,\n    _debug: {\n      cacheMiss:  true,\n      cacheKey:   cacheKey,\n      missReason: missReason\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        208
+      ],
+      "id": "c690beee-dae4-422d-8068-97055a569c21",
+      "name": "Check Cache"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "properties",
+        "limit": 10,
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "city",
+              "condition": "eq",
+              "keyValue": "={{ $node[\"Parse AI + Save State\"].json.updatedState.city }}"
+            },
+            {
+              "keyName": "price",
+              "condition": "gte",
+              "keyValue": "={{ $node[\"Parse AI + Save State\"].json.updatedState.min_price || 0 }}"
+            },
+            {
+              "keyName": "price",
+              "condition": "lte",
+              "keyValue": "={{ $node[\"Parse AI + Save State\"].json.updatedState.max_price || 999999999 }}"
+            },
+            {
+              "keyName": "property_type",
+              "condition": "eq",
+              "keyValue": "={{ $node[\"Parse AI + Save State\"].json.updatedState.property_type }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        848,
+        256
+      ],
+      "id": "af091361-c6e6-4add-a9ab-f43a5ee5fd53",
+      "name": "Get many rows",
+      "credentials": {
+        "supabaseApi": {
+          "id": "tGd1CaJHZUtqLXXB",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE 4 — SAVE CACHE + TOP 3\n// Position: Right after Supabase \"Get Many Rows\" node\n// Purpose: Save ALL raw results to cache → apply all filters\n//          → sort → return top 3 to Format Response\n// ============================================================\n\nconst staticData = $getWorkflowStaticData('global');\n\n// ============================================================\n// STEP 1 — COLLECT ALL SUPABASE ROWS\n// Supabase returns each row as a separate n8n item.\n// $input.all() collects every item into one array.\n// ============================================================\n\nconst allItems = $input.all();\n\n// Guard: if Supabase returned nothing at all (not even empty)\nif (!allItems || allItems.length === 0) {\n  const fallbackState = staticData.conversationState || {};\n  return [{\n    json: {\n      results:      [],\n      state:        fallbackState,\n      fromCache:    false,\n      totalFetched: 0,\n      _debug: {\n        error: 'Supabase returned no items — possible connection issue',\n        cacheKey: buildCacheKey(fallbackState.city, fallbackState.property_type)\n      }\n    }\n  }];\n}\n\n// Extract raw JSON data from each n8n item\nconst rawResults = allItems.map(item => item.json).filter(Boolean);\n\n// ============================================================\n// STEP 2 — READ STATE FROM PREVIOUS NODE\n// The state was passed through by Node 3 (Check Cache)\n// inside the first item's json.updatedState\n// ============================================================\n\nconst firstItem   = allItems[0]?.json || {};\nconst state       = firstItem.updatedState\n                 || firstItem.state\n                 || staticData.conversationState\n                 || {};\nconst cacheKey    = firstItem.cacheKey || buildCacheKey(state.city, state.property_type);\nconst friendlyMsg = firstItem.friendly_message || null;\nconst missingInfo = firstItem.missing_info     || null;\n\n// ============================================================\n// HELPER FUNCTIONS\n// ============================================================\n\n// ── Builds normalized composite cache key ──\nfunction buildCacheKey(city, propertyType) {\n  const safeCity = (city || '').toLowerCase().trim().replace(/\\s+/g, '_');\n  const safeType = (propertyType || '').toLowerCase().trim().replace(/\\s+/g, '_');\n  if (!safeCity || !safeType) return null;\n  return `${safeCity}__${safeType}`;\n}\n\n// ── Cleans and normalizes a single property row from Supabase ──\nfunction normalizeProperty(row) {\n  if (!row || typeof row !== 'object') return null;\n\n  return {\n    id:            row.id            || null,\n    property_type: row.property_type || null,\n    price:         row.price !== undefined && row.price !== null\n                     ? Number(row.price)\n                     : null,\n    city:          row.city          || null,\n    state:         row.state         || null,\n    availability:  typeof row.availability === 'boolean'\n                     ? row.availability\n                     : row.availability === 'true'\n                       ? true\n                       : row.availability === 'false'\n                         ? false\n                         : null,\n    bedrooms:      row.bedrooms !== undefined && row.bedrooms !== null\n                     ? parseInt(row.bedrooms, 10)\n                     : null,\n    amenities:     Array.isArray(row.amenities)\n                     ? row.amenities\n                     : typeof row.amenities === 'string'\n                       ? row.amenities.replace(/[{}\"]/g, '').split(',').map(a => a.trim()).filter(Boolean)\n                       : []\n  };\n}\n\n// ── Applies ALL active filters from state ──\nfunction applyFilters(results, state) {\n  let filtered = [...results];\n  const log    = [];\n\n  // Filter 1: property_type (exact match, case-insensitive)\n  if (state.property_type) {\n    const type = state.property_type.toLowerCase().trim();\n    filtered   = filtered.filter(p =>\n      (p.property_type || '').toLowerCase().trim() === type\n    );\n    log.push(`property_type=\"${state.property_type}\" → ${filtered.length} left`);\n  }\n\n  // Filter 2: city (case-insensitive)\n  if (state.city) {\n    const city = state.city.toLowerCase().trim();\n    filtered   = filtered.filter(p =>\n      (p.city || '').toLowerCase().trim() === city\n    );\n    log.push(`city=\"${state.city}\" → ${filtered.length} left`);\n  }\n\n  // Filter 3: min_price\n  if (state.min_price !== null && state.min_price !== undefined) {\n    const min = Number(state.min_price);\n    filtered  = filtered.filter(p =>\n      p.price !== null && Number(p.price) >= min\n    );\n    log.push(`min_price=$${min} → ${filtered.length} left`);\n  }\n\n  // Filter 4: max_price\n  if (state.max_price !== null && state.max_price !== undefined) {\n    const max = Number(state.max_price);\n    filtered  = filtered.filter(p =>\n      p.price !== null && Number(p.price) <= max\n    );\n    log.push(`max_price=$${max} → ${filtered.length} left`);\n  }\n\n  // Filter 5: bedrooms (exact match)\n  if (state.bedrooms !== null && state.bedrooms !== undefined) {\n    const beds = parseInt(state.bedrooms, 10);\n    filtered   = filtered.filter(p =>\n      p.bedrooms !== null && parseInt(p.bedrooms, 10) === beds\n    );\n    log.push(`bedrooms=${beds} → ${filtered.length} left`);\n  }\n\n  // Filter 6: availability\n  if (state.availability !== null && state.availability !== undefined) {\n    filtered = filtered.filter(p => p.availability === state.availability);\n    log.push(`availability=${state.availability} → ${filtered.length} left`);\n  }\n\n  return { filtered, log };\n}\n\n// ── Sorts results: available first, then by price ascending ──\nfunction sortResults(results) {\n  return [...results].sort((a, b) => {\n    // Available properties first\n    if (a.availability === true && b.availability !== true) return -1;\n    if (b.availability === true && a.availability !== true) return  1;\n\n    // Then sort by price ascending (cheapest first)\n    const priceA = a.price ?? Infinity;\n    const priceB = b.price ?? Infinity;\n    return priceA - priceB;\n  });\n}\n\n// ============================================================\n// STEP 3 — NORMALIZE ALL RAW ROWS FROM SUPABASE\n// Clean every row: fix types, handle nulls, parse amenities\n// ============================================================\n\nconst normalizedResults = rawResults\n  .map(normalizeProperty)\n  .filter(Boolean); // Remove any rows that failed normalization\n\n// ============================================================\n// STEP 4 — SAVE ALL NORMALIZED RESULTS TO CACHE\n// Save BEFORE filtering so future price/bedroom changes\n// can re-filter the full set without hitting DB again.\n// ============================================================\n\nif (!staticData.cache) staticData.cache = {};\n\nif (cacheKey) {\n  staticData.cache[cacheKey] = {\n    results:  normalizedResults,   // Full unfiltered set\n    cachedAt: new Date().toISOString(),\n    city:     state.city,\n    type:     state.property_type,\n    count:    normalizedResults.length\n  };\n}\n\n// ============================================================\n// STEP 5 — APPLY FILTERS\n// Now filter the full set down to matching results\n// ============================================================\n\nconst { filtered, log: filterLog } = applyFilters(normalizedResults, state);\n\n// ============================================================\n// STEP 6 — SORT\n// Available first → then cheapest first\n// ============================================================\n\nconst sorted = sortResults(filtered);\n\n// ============================================================\n// STEP 7 — SLICE TOP 3\n// ============================================================\n\nconst top3 = sorted.slice(0, 3);\n\n// ============================================================\n// STEP 8 — RETURN\n// ============================================================\n\nreturn [{\n  json: {\n    results:          top3,\n    state:            state,\n    fromCache:        false,\n    friendly_message: friendlyMsg,\n    missing_info:     missingInfo,\n    _debug: {\n      totalFetchedFromDB:  rawResults.length,\n      afterNormalization:  normalizedResults.length,\n      afterFilters:        filtered.length,\n      returning:           top3.length,\n      filterSteps:         filterLog,\n      cacheKey:            cacheKey,\n      cachedAt:            staticData.cache[cacheKey]?.cachedAt || null,\n      sortOrder:           'available first, then price ascending',\n      filtersActive: {\n        property_type: state.property_type || null,\n        city:          state.city          || null,\n        min_price:     state.min_price     || null,\n        max_price:     state.max_price     || null,\n        bedrooms:      state.bedrooms      || null,\n        availability:  state.availability  ?? null\n      }\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1312,
+        144
+      ],
+      "id": "e025bd76-f079-48ef-8174-a24861f7cd9d",
+      "name": " Save to Cache + Filter"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "llama-3.3-70b-versatile",
+          "mode": "id"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -624,
+        416
+      ],
+      "id": "cba538fd-fcde-4635-a13f-3cd786e8ea6e",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "ipequPm5hmJKLIiG",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://api.openweathermap.org/data/2.5/weather",
+        "sendQuery": true,
+        "specifyQuery": "json",
+        "jsonQuery": "={\n  \"q\": \"{{ $node['Parse AI + Save State'].json.updatedState.city }}\",\n  \"appid\": \"b91b7a9a2607a331b25241f648d82382\",\n  \"units\": \"metric\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        320,
+        336
+      ],
+      "id": "143d67da-589e-42c5-9d28-7a20cefc0ac4",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE 6 — FORMAT RESPONSE\n// Position: Last node before \"Respond to Webhook\"\n// Purpose: All three branches merge here → detect which\n//          branch arrived → format into one clean reply\n// ============================================================\n\nconst staticData = $getWorkflowStaticData('global');\nconst input      = $input.first()?.json;\n\n// ============================================================\n// HELPER FUNCTIONS\n// ============================================================\n\nfunction safeStr(value, fallback = '') {\n  if (value === null || value === undefined) return fallback;\n  const str = String(value).trim();\n  return str.length > 0 ? str : fallback;\n}\n\nfunction formatPrice(price) {\n  const num = Number(price);\n  if (isNaN(num) || num <= 0) return 'Price not listed';\n  return '$' + num.toLocaleString('en-US');\n}\n\nfunction formatBedrooms(bedrooms) {\n  const n = parseInt(bedrooms, 10);\n  if (isNaN(n) || n < 0) return null;\n  if (n === 0) return 'Studio';\n  if (n === 1) return '1 bed';\n  return `${n} beds`;\n}\n\nfunction formatAmenities(amenities) {\n  if (!Array.isArray(amenities) || amenities.length === 0) {\n    return 'No amenities listed';\n  }\n  return amenities\n    .filter(Boolean)\n    .map(a => String(a).trim())\n    .join(' · ');\n}\n\nfunction formatAvailability(availability) {\n  if (availability === true)  return 'Available now';\n  if (availability === false) return 'Not available';\n  return null;\n}\n\n// ── Validates a property row is real and not a ghost row ──\n// Supabase can return empty/null rows. A valid result needs\n// at least 2 of these 3 core fields to be considered real.\nfunction isValidResult(property) {\n  if (!property || typeof property !== 'object') return false;\n\n  const hasType  = property.property_type &&\n                   typeof property.property_type === 'string' &&\n                   property.property_type.trim().length > 0;\n\n  const hasPrice = property.price !== null     &&\n                   property.price !== undefined &&\n                   Number(property.price) > 0;\n\n  const hasCity  = property.city &&\n                   typeof property.city === 'string' &&\n                   property.city.trim().length > 0;\n\n  const validFieldCount = [hasType, hasPrice, hasCity]\n    .filter(Boolean).length;\n\n  return validFieldCount >= 2;\n}\n\nfunction formatPropertyCard(property, index) {\n  if (!property || typeof property !== 'object') return null;\n\n  const num          = index + 1;\n  const type         = safeStr(property.property_type, 'Property');\n  const price        = formatPrice(property.price);\n  const city         = safeStr(property.city, '');\n  const stateName    = safeStr(property.state, '');\n  const location     = [city, stateName].filter(Boolean).join(', ');\n  const beds         = formatBedrooms(property.bedrooms);\n  const amenities    = formatAmenities(property.amenities);\n  const availability = formatAvailability(property.availability);\n\n  let card = `${num}. ${type} — ${price}/mo\\n`;\n  if (location)     card += `   📍 ${location}\\n`;\n\n  const details = [beds, availability].filter(Boolean);\n  if (details.length > 0) card += `   ${details.join(' · ')}\\n`;\n\n  card += `   Amenities: ${amenities}\\n`;\n  return card;\n}\n\nfunction buildIntroLine(count, state, fromCache) {\n  const type  = safeStr(state?.property_type, 'properties');\n  const city  = safeStr(state?.city, '');\n  const cache = fromCache ? ' ⚡' : '';\n\n  if (count === 1) {\n    return city\n      ? `I found 1 ${type} in ${city} that matches your criteria${cache}:`\n      : `I found 1 ${type} that matches your criteria${cache}:`;\n  }\n  return city\n    ? `Great news! Here are ${count} ${type}s in ${city} that match your criteria${cache}:`\n    : `Great news! Here are ${count} ${type}s that match your criteria${cache}:`;\n}\n\nfunction buildSearchSummary(state) {\n  const parts = [];\n  if (state?.min_price && state?.max_price) {\n    parts.push(`budget $${Number(state.min_price).toLocaleString()}–$${Number(state.max_price).toLocaleString()}`);\n  } else if (state?.min_price) {\n    parts.push(`min $${Number(state.min_price).toLocaleString()}`);\n  } else if (state?.max_price) {\n    parts.push(`max $${Number(state.max_price).toLocaleString()}`);\n  }\n  if (state?.bedrooms)           parts.push(formatBedrooms(state.bedrooms));\n  if (state?.availability === true)  parts.push('available now');\n  if (state?.availability === false) parts.push('all listings');\n\n  return parts.length > 0\n    ? `Search filters: ${parts.join(', ')}`\n    : null;\n}\n\nfunction buildNoResultsMessage(state) {\n  const type = safeStr(state?.property_type, 'properties');\n  const city = safeStr(state?.city, '');\n\n  let msg = city\n    ? `I couldn't find any ${type}s in ${city} matching your criteria.`\n    : `I couldn't find any ${type}s matching your criteria.`;\n\n  const suggestions = [];\n  if (state?.min_price || state?.max_price) suggestions.push('adjusting your budget');\n  if (state?.bedrooms)                      suggestions.push('changing the number of bedrooms');\n  if (state?.city)                          suggestions.push('searching in a nearby city');\n\n  if (suggestions.length > 0) {\n    msg += ` You could try ${suggestions.join(' or ')}.`;\n  }\n\n  msg += '\\nWhat would you like to change?';\n  return msg;\n}\n\nfunction buildMissingInfoPrompt(missingInfo, state) {\n  if (missingInfo && typeof missingInfo === 'string' && missingInfo.trim()) {\n    return `\\n\\n${missingInfo.trim()}`;\n  }\n  if (!state?.property_type) {\n    return '\\n\\nWhat type of property are you looking for? (Apartment, Studio, Villa, etc.)';\n  }\n  if (!state?.city) {\n    return '\\n\\nWhich city would you like to search in?';\n  }\n  return '';\n}\n\n// ============================================================\n// GUARD: Handle completely missing input\n// ============================================================\n\nif (!input) {\n  return [{\n    json: {\n      reply: \"Something went wrong on my end. Could you send your message again?\",\n      _debug: { error: 'No input received in Format Response node' }\n    }\n  }];\n}\n\n// ============================================================\n// BRANCH DETECTION — FIXED PRIORITY ORDER\n// ============================================================\n\nconst rawResults   = Array.isArray(input.results) ? input.results : [];\n\n// ── Filter out ghost/empty rows from Supabase ──\nconst validResults = rawResults.filter(isValidResult);\n\nconst hasValidResults = validResults.length > 0;\nconst hasDirectReply  = typeof input.reply === 'string' &&\n                        input.reply.trim().length > 0;\nconst hasFriendly     = typeof input.friendly_message === 'string' &&\n                        input.friendly_message.trim().length > 0;\nconst hasMissingInfo  = typeof input.missing_info === 'string' &&\n                        input.missing_info.trim().length > 0;\n\nconst state       = input.updatedState ||\n                    input.state        ||\n                    staticData.conversationState || {};\nconst fromCache   = input.fromCache === true;\nconst missingInfo = input.missing_info || null;\n\n// ── Key guard: if state is empty, AI is still collecting\n//    info — never show DB results with null state ──\nconst stateIsEmpty   = !state.property_type && !state.city;\nconst aiNeedsMoreInfo = stateIsEmpty || hasMissingInfo;\n\nlet finalReply = '';\nlet branchUsed = '';\n\n// ============================================================\n// BRANCH 1 — AI NEEDS MORE INFO (highest priority)\n// Fires when: state is empty OR missing_info is set\n// This MUST come before DB_SEARCH check so that a ghost\n// result row never overrides the AI's clarifying question.\n// ============================================================\n\nif (aiNeedsMoreInfo && hasFriendly) {\n  branchUsed = 'PLAIN_CHAT_PRIORITY';\n  finalReply = input.friendly_message.trim();\n  finalReply += buildMissingInfoPrompt(missingInfo, state);\n}\n\n// ============================================================\n// BRANCH 2 — DB SEARCH RESULTS (valid results only)\n// Fires when: valid results exist AND state has property_type\n// ============================================================\n\nelse if (hasValidResults && state.property_type) {\n  branchUsed = 'DB_SEARCH';\n\n  const intro   = buildIntroLine(validResults.length, state, fromCache);\n  finalReply    = intro ? intro + '\\n\\n' : '';\n\n  const summary = buildSearchSummary(state);\n  if (summary) finalReply += `${summary}\\n\\n`;\n\n  const cards = validResults\n    .map((property, index) => formatPropertyCard(property, index))\n    .filter(Boolean);\n\n  finalReply += cards.join('\\n');\n\n  if (validResults.length === 3) {\n    finalReply += '\\nWant me to refine these results? '\n      + 'You can adjust the budget, bedrooms, or city.';\n  } else {\n    finalReply += `\\nThese are all the ${state?.property_type || 'properties'} `\n      + 'I found matching your criteria. '\n      + 'Want to broaden the search?';\n  }\n}\n\n// ============================================================\n// BRANCH 3 — NO VALID RESULTS (ran DB but got nothing real)\n// Fires when: results array exists but all rows are invalid\n// ============================================================\n\nelse if (input.results !== undefined && !hasValidResults && state.property_type) {\n  branchUsed = 'NO_RESULTS';\n  finalReply = buildNoResultsMessage(state);\n}\n\n// ============================================================\n// BRANCH 4 — WEATHER REPLY\n// Fires when: reply string set by Node 5\n// ============================================================\n\nelse if (hasDirectReply) {\n  branchUsed = 'WEATHER';\n  finalReply = input.reply;\n  finalReply += buildMissingInfoPrompt(missingInfo, state);\n}\n\n// ============================================================\n// BRANCH 5 — PLAIN CHAT / AI RESPONSE\n// Fires when: friendly_message from AI\n// ============================================================\n\nelse if (hasFriendly) {\n  branchUsed = 'PLAIN_CHAT';\n  finalReply = input.friendly_message.trim();\n  finalReply += buildMissingInfoPrompt(missingInfo, state);\n}\n\n// ============================================================\n// BRANCH 6 — ABSOLUTE FALLBACK\n// ============================================================\n\nelse {\n  branchUsed = 'FALLBACK';\n  const type = safeStr(state?.property_type, '');\n  const city = safeStr(state?.city, '');\n\n  if (type && city) {\n    finalReply = `I'm ready to search for ${type}s in ${city}. Would you like me to go ahead?`;\n  } else if (type) {\n    finalReply = `I'm looking for ${type}s for you. Which city should I search in?`;\n  } else {\n    finalReply = \"I'm here to help you find the perfect property. \"\n      + \"What type of property are you looking for? \"\n      + \"(Apartment, Studio, Villa, etc.)\";\n  }\n}\n\n// ============================================================\n// FINAL SAFETY NET\n// ============================================================\n\nif (!finalReply || !finalReply.trim()) {\n  finalReply = \"I'm here to help you find a property. What are you looking for?\";\n}\n\n// ============================================================\n// RETURN\n// ============================================================\n\nreturn [{\n  json: {\n    reply: finalReply.trim(),\n    _debug: {\n      branchUsed,\n      fromCache,\n      rawResultCount:   rawResults.length,\n      validResultCount: validResults.length,\n      ghostRowsDropped: rawResults.length - validResults.length,\n      hasValidResults,\n      hasDirectReply,\n      hasFriendly,\n      hasMissingInfo,\n      stateIsEmpty,\n      aiNeedsMoreInfo,\n      stateSnapshot: {\n        property_type: state?.property_type || null,\n        city:          state?.city          || null,\n        min_price:     state?.min_price     || null,\n        max_price:     state?.max_price     || null,\n        bedrooms:      state?.bedrooms      || null,\n        availability:  state?.availability  ?? null\n      },\n      replyLength: finalReply.trim().length,\n      timestamp:   new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1408,
+        416
+      ],
+      "id": "1f1ea8bf-0ef2-4f3b-a9ed-078698ac6b15",
+      "name": "Format Response"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// NODE 5 — WEATHER FORMATTER\n// Position: Right after OpenWeather HTTP Request node\n// Purpose: Extract only useful fields from the huge\n//          OpenWeather API response → build one friendly\n//          sentence → pass to Format Response node\n// ============================================================\n\nconst staticData = $getWorkflowStaticData('global');\nconst weatherRaw = $input.first()?.json;\n\n// ============================================================\n// HELPER FUNCTIONS\n// ============================================================\n\n// ── Safely rounds a number, returns null if invalid ──\nfunction safeRound(value) {\n  const num = Number(value);\n  return isNaN(num) ? null : Math.round(num);\n}\n\n// ── Converts wind speed (m/s) to a human label ──\nfunction windLabel(speedMs) {\n  const s = Number(speedMs);\n  if (isNaN(s))  return 'unknown winds';\n  if (s < 0.5)   return 'calm';\n  if (s < 3.3)   return 'light breeze';\n  if (s < 7.9)   return 'moderate breeze';\n  if (s < 13.8)  return 'fresh breeze';\n  if (s < 20.7)  return 'strong winds';\n  if (s < 28.4)  return 'near gale';\n  return 'storm-level winds';\n}\n\n// ── Converts humidity % to a human label ──\nfunction humidityLabel(pct) {\n  const h = Number(pct);\n  if (isNaN(h)) return '';\n  if (h < 30)   return 'very dry';\n  if (h < 50)   return 'comfortable';\n  if (h < 70)   return 'moderate humidity';\n  if (h < 85)   return 'humid';\n  return 'very humid';\n}\n\n// ── Converts visibility (metres) to a readable string ──\nfunction visibilityLabel(metres) {\n  if (metres === undefined || metres === null) return null;\n  const m = Number(metres);\n  if (isNaN(m)) return null;\n  if (m >= 10000) return 'excellent visibility';\n  if (m >= 5000)  return 'good visibility';\n  if (m >= 1000)  return 'moderate visibility';\n  return 'poor visibility';\n}\n\n// ── Converts Unix timestamp + timezone offset → local time ──\nfunction toLocalTime(unixSeconds, timezoneOffsetSeconds) {\n  if (!unixSeconds) return null;\n  const utcMs      = unixSeconds * 1000;\n  const offsetMs   = (timezoneOffsetSeconds || 0) * 1000;\n  const localDate  = new Date(utcMs + offsetMs);\n\n  const hours   = localDate.getUTCHours();\n  const minutes = String(localDate.getUTCMinutes()).padStart(2, '0');\n  const ampm    = hours >= 12 ? 'PM' : 'AM';\n  const h12     = hours % 12 || 12;\n  return `${h12}:${minutes} ${ampm}`;\n}\n\n// ── Capitalises first letter of a string ──\nfunction capitalise(str) {\n  if (!str || typeof str !== 'string') return '';\n  return str.charAt(0).toUpperCase() + str.slice(1);\n}\n\n// ── Picks a relevant emoji based on weather condition code ──\nfunction weatherEmoji(conditionCode, isDay) {\n  if (!conditionCode) return '';\n  const code = Number(conditionCode);\n\n  if (code >= 200 && code < 300) return 'stormy';\n  if (code >= 300 && code < 400) return 'drizzling';\n  if (code >= 500 && code < 600) return 'rainy';\n  if (code >= 600 && code < 700) return 'snowy';\n  if (code >= 700 && code < 800) return 'foggy';\n  if (code === 800) return isDay ? 'sunny' : 'clear night';\n  if (code === 801 || code === 802) return 'partly cloudy';\n  if (code >= 803) return 'overcast';\n  return '';\n}\n\n// ── Builds a clothing/activity suggestion based on conditions ──\nfunction buildSuggestion(tempC, conditionCode, windSpeedMs) {\n  const temp = Number(tempC);\n  const code = Number(conditionCode);\n  const wind = Number(windSpeedMs);\n  const tips = [];\n\n  if (isNaN(temp)) return null;\n\n  // Temperature tips\n  if (temp <= 0)        tips.push(\"it's freezing — heavy coat and gloves essential\");\n  else if (temp <= 10)  tips.push(\"quite cold — a warm coat is recommended\");\n  else if (temp <= 18)  tips.push(\"cool weather — a light jacket is a good idea\");\n  else if (temp <= 25)  tips.push(\"pleasant temperature for house viewings\");\n  else if (temp <= 32)  tips.push(\"warm day — light clothing recommended\");\n  else                  tips.push(\"very hot — stay hydrated during property visits\");\n\n  // Rain tips\n  if (code >= 200 && code < 700) tips.push(\"bring an umbrella\");\n\n  // Wind tips\n  if (!isNaN(wind) && wind >= 13.8) tips.push(\"expect strong winds\");\n\n  return tips.join(', ');\n}\n\n// ============================================================\n// GUARD: Handle missing or failed API response\n// ============================================================\n\nif (!weatherRaw) {\n  const state = staticData.conversationState || {};\n  return [{\n    json: {\n      action:           'RESPOND',\n      updatedState:     state,\n      reply:            \"I wasn't able to fetch the weather right now. \" +\n                        \"Would you like to continue your property search instead?\",\n      _debug: { error: 'No weather data received — HTTP node may have failed' }\n    }\n  }];\n}\n\n// OpenWeather returns an error object with a \"cod\" field\n// e.g. { cod: '404', message: 'city not found' }\nif (weatherRaw.cod && String(weatherRaw.cod) !== '200') {\n  const state      = staticData.conversationState || {};\n  const errMessage = weatherRaw.message || 'Unknown error';\n  const cityTried  = state.city || 'that location';\n\n  return [{\n    json: {\n      action:       'RESPOND',\n      updatedState: state,\n      reply:        `I couldn't find weather data for ${cityTried}. ` +\n                    `The API said: \"${errMessage}\". ` +\n                    `Want me to try a different city, or continue your property search?`,\n      _debug: {\n        apiError:  errMessage,\n        apiCode:   weatherRaw.cod,\n        cityTried: cityTried\n      }\n    }\n  }];\n}\n\n// ============================================================\n// STEP 1 — EXTRACT ALL USEFUL FIELDS\n// ============================================================\n\n// Core identifiers\nconst cityName    = weatherRaw.name                        || 'Unknown City';\nconst countryCode = weatherRaw.sys?.country               || '';\nconst timezoneOffset = weatherRaw.timezone                 || 0;\n\n// Temperature block\nconst tempC       = safeRound(weatherRaw.main?.temp);\nconst feelsLikeC  = safeRound(weatherRaw.main?.feels_like);\nconst tempMinC    = safeRound(weatherRaw.main?.temp_min);\nconst tempMaxC    = safeRound(weatherRaw.main?.temp_max);\n\n// Condition block (weather is an array — take primary condition)\nconst conditions     = Array.isArray(weatherRaw.weather) ? weatherRaw.weather : [];\nconst primaryCond    = conditions[0] || {};\nconst conditionCode  = primaryCond.id          || null;\nconst conditionMain  = primaryCond.main         || 'Unknown';\nconst conditionDesc  = primaryCond.description  || 'no description available';\n\n// Atmosphere block\nconst humidity    = weatherRaw.main?.humidity    ?? null;\nconst pressure    = weatherRaw.main?.pressure    ?? null;\nconst visibility  = weatherRaw.visibility        ?? null;\nconst cloudPct    = weatherRaw.clouds?.all       ?? null;\n\n// Wind block\nconst windSpeed   = weatherRaw.wind?.speed       ?? null;\nconst windDeg     = weatherRaw.wind?.deg         ?? null;\nconst windGust    = weatherRaw.wind?.gust        ?? null;\n\n// Sun times\nconst sunriseTime = toLocalTime(weatherRaw.sys?.sunrise, timezoneOffset);\nconst sunsetTime  = toLocalTime(weatherRaw.sys?.sunset,  timezoneOffset);\n\n// Determine day or night from condition icon\nconst isDay = primaryCond.icon\n  ? !primaryCond.icon.endsWith('n')\n  : true;\n\n// ============================================================\n// STEP 2 — BUILD HUMAN LABELS FROM RAW VALUES\n// ============================================================\n\nconst weatherType  = weatherEmoji(conditionCode, isDay);\nconst windDesc     = windLabel(windSpeed);\nconst humidityDesc = humidityLabel(humidity);\nconst visibilityDesc = visibilityLabel(visibility);\nconst suggestion   = buildSuggestion(tempC, conditionCode, windSpeed);\n\n// ============================================================\n// STEP 3 — READ CONVERSATION STATE\n// We use this to keep property search context alive\n// even while the user is asking about weather\n// ============================================================\n\nconst convState     = staticData.conversationState || {};\nconst propertyType  = convState.property_type || null;\nconst searchCity    = convState.city          || null;\n\n// ============================================================\n// STEP 4 — BUILD THE REPLY SENTENCE\n// Core: temp + feels like + condition + wind + humidity\n// Tail: property search context bridge\n// ============================================================\n\n// ── Core weather line ──\nlet weatherLine = `The weather in ${cityName}`;\nif (countryCode) weatherLine += `, ${countryCode}`;\nweatherLine += ` right now`;\n\nif (tempC !== null) {\n  weatherLine += ` is ${tempC}°C`;\n  if (feelsLikeC !== null && feelsLikeC !== tempC) {\n    weatherLine += ` (feels like ${feelsLikeC}°C)`;\n  }\n}\n\nweatherLine += ` — ${capitalise(conditionDesc)}`;\n\nif (weatherType) weatherLine += `, ${weatherType}`;\n\n// ── Details line ──\nconst detailParts = [];\nif (humidity !== null)    detailParts.push(`${humidity}% humidity (${humidityDesc})`);\nif (windSpeed !== null)   detailParts.push(`${windDesc}`);\nif (visibilityDesc)       detailParts.push(visibilityDesc);\nif (cloudPct !== null)    detailParts.push(`${cloudPct}% cloud cover`);\n\nconst detailLine = detailParts.length > 0\n  ? `\\n${detailParts.join(' · ')}`\n  : '';\n\n// ── Today's range line ──\nconst rangeLine = (tempMinC !== null && tempMaxC !== null)\n  ? `\\nToday's range: ${tempMinC}°C – ${tempMaxC}°C`\n  : '';\n\n// ── Sun times line ──\nconst sunLine = (sunriseTime && sunsetTime)\n  ? `\\nSunrise ${sunriseTime} · Sunset ${sunsetTime} (local time)`\n  : '';\n\n// ── Suggestion line ──\nconst suggestionLine = suggestion\n  ? `\\nTip: ${capitalise(suggestion)}.`\n  : '';\n\n// ── Bridge back to property search ──\nlet bridgeLine = '';\nif (propertyType && searchCity) {\n  bridgeLine = `\\n\\nWould you like to continue your ${propertyType} search in ${searchCity}?`;\n} else if (propertyType) {\n  bridgeLine = `\\n\\nShall I continue searching for ${propertyType}s for you?`;\n} else {\n  bridgeLine = `\\n\\nWould you like to search for properties in ${cityName}?`;\n}\n\n// ── Assemble full reply ──\nconst fullReply = weatherLine\n  + detailLine\n  + rangeLine\n  + sunLine\n  + suggestionLine\n  + bridgeLine;\n\n// ============================================================\n// STEP 5 — RETURN\n// ============================================================\n\nreturn [{\n  json: {\n    action:       'RESPOND',\n    updatedState: convState,\n    reply:        fullReply,\n    _debug: {\n      cityName,\n      countryCode,\n      tempC,\n      feelsLikeC,\n      tempMinC,\n      tempMaxC,\n      conditionCode,\n      conditionMain,\n      conditionDesc,\n      weatherType,\n      humidity,\n      humidityDesc,\n      windSpeed,\n      windDesc,\n      windGust,\n      visibilityDesc,\n      cloudPct,\n      sunriseTime,\n      sunsetTime,\n      isDay,\n      suggestion,\n      propertyContextKept: !!propertyType,\n      bridgeCity: searchCity || cityName\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        512,
+        432
+      ],
+      "id": "2e904964-302f-49ac-b3a5-a9d1ff159fd4",
+      "name": "Format Weather Response"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"reply\": $json.reply } }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1616,
+        416
+      ],
+      "id": "7ee2db82-d510-4036-85a8-65b980935b1a",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "02343059-a2d0-4274-bf79-d49ed092e242",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1040,
+        160
+      ],
+      "id": "5e2c0094-9fb9-4c4c-bb0a-b7ea8f70ee07",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "2b2911ef-2522-4f88-8414-beb3070cc8e8",
+              "name": "friendly_message",
+              "value": "=I couldn't find any {{ $node['Parse AI + Save State'].json.updatedState.property_type }}s in {{ $node['Parse AI + Save State'].json.updatedState.city }}. Would you like to adjust your budget or location?",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1184,
+        320
+      ],
+      "id": "a32712ae-a2e6-428c-b9c3-2c08c87f3f73",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -96,
+        16
+      ],
+      "id": "f699fa00-cb44-4c74-ac01-7e8fd72d0679",
+      "name": "Error Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{\n  json: {\n    reply: \"Oops, something went wrong on my end. Could you try again? \" +\n           \"I remember you were looking for a \" + \n           ($getWorkflowStaticData('global').conversationState?.property_type || 'property') + \".\"\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        112,
+        16
+      ],
+      "id": "66f1e16f-ae1a-4d2b-8c41-a9cc6e36a8bd",
+      "name": "Code in JavaScript"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Load State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load State": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse AI + Save State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI + Save State": {
+      "main": [
+        [
+          {
+            "node": "Check Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": " Save to Cache + Filter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Cache": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Get many rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many rows": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Format Weather Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Weather Response": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    " Save to Cache + Filter": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": " Save to Cache + Filter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "3017b05e-08db-4d83-82e2-caefce87256c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "f73b20825ff7e32d134e3fed647d9f481694f1aabf236bd1655c7fb53372d4b5"
+  },
+  "id": "CCsf9xeRBZRmGb38",
+  "tags": []
+}
