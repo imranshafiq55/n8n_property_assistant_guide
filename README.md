@@ -1,55 +1,119 @@
-🏠 AI Property Assistant (n8n + Supabase)
+# 🏠 AI Property Assistant (n8n + Supabase)
 
-An AI-powered real estate assistant that manages stateful conversations, intelligently queries property data, and provides contextual responses like weather updates using a workflow-based architecture.
+An AI-powered real estate assistant built using **n8n workflows** and **Supabase**, designed to handle stateful conversations, intelligent property search, and dynamic tool routing (weather + database queries).
 
-🚀 Project Overview
+---
 
-This project demonstrates a smart automation system built using n8n as the workflow engine and Supabase as the database layer.
-The assistant is designed to handle real-world, fragmented user conversations while maintaining context throughout the session.
+## 🚀 Overview
 
-Unlike traditional chatbots, this system remembers user preferences and dynamically adapts queries in real time.
+This project demonstrates a **workflow-based AI system** that goes beyond simple chatbots by maintaining context, updating user preferences in real time, and executing intelligent actions based on user intent.
 
-⚙️ Core Features
-🧠 Stateful Conversations using n8n Static Data (no external memory DB required)
-🏡 Dynamic Property Search with Supabase filtering
-🌦️ Weather API Integration based on user intent
-⚡ Smart Caching Layer to reduce redundant database calls
-🔄 AI-Powered Routing between tools (DB search vs Weather API)
-📊 Handles structured extraction of user preferences (city, budget, property type, etc.)
-🗄️ Database Schema (Supabase)
+Instead of relying on traditional memory systems, it uses **n8n static workflow data** to persist state across the conversation.
 
-The system uses a properties table with fields like:
+---
 
-property_type
-price
-city
-state
-availability
-bedrooms
-amenities
-🧩 How It Works
-User sends a message
-AI extracts key entities and updates workflow state
-System checks if required fields (like property_type) are available
-Based on intent:
-Queries Supabase for property listings
-OR calls Weather API for contextual info
-Results are returned in a conversational format
-💡 Key Innovation
+## ⚙️ Features
 
-The assistant maintains conversation memory without a traditional database memory layer, using n8n static workflow data and structured JSON state management.
+- 🧠 Stateful conversation handling using `getWorkflowStaticData`
+- 🏡 Dynamic property search with Supabase
+- 🌦️ Weather API integration for contextual queries
+- 🔄 AI-powered routing between tools (DB vs Weather)
+- ⚡ City-based caching for performance optimization
+- 📊 Structured extraction of user preferences (city, budget, property type, etc.)
+- 💬 Conversational response formatting for end users
 
-📦 Tech Stack
-n8n (Workflow Automation)
-Supabase (Database)
-AI Agent (Intent & Entity Extraction)
-Weather API
-Custom Caching Logic
-📌 Status
+---
 
-🚧 In Development / Prototype Phase
-Focus: Improving real-world AI workflow reliability and performance
+## 🗄️ Database Schema (Supabase)
 
-👨‍💻 Author
+Table: `properties`
 
-Imran Shafique
+| Column Name    | Data Type     | Description                          |
+|----------------|--------------|--------------------------------------|
+| id             | UUID / Int    | Primary Key                          |
+| property_type  | String        | Apartment, Villa, Studio (Required)  |
+| price          | Numeric       | Listing price                        |
+| city           | String        | City location                        |
+| state          | String        | State / Province                     |
+| availability   | Boolean       | Available for sale/lease            |
+| bedrooms       | Integer       | Number of rooms                     |
+| amenities      | Text[]        | Property features                   |
+
+---
+
+## 🧩 Workflow Logic
+
+### 1. Input Processing
+- User message is sent to AI agent
+- Entities (city, budget, property type) are extracted
+- JSON state is updated using static workflow data
+
+### 2. State Management
+- Conversation state is stored in `getWorkflowStaticData`
+- Ensures memory across multiple user messages
+
+### 3. Decision Engine
+- If `property_type + city` exist → trigger Supabase search
+- If weather intent detected → call Weather API
+- Otherwise → request missing information
+
+### 4. Data Retrieval
+- Query Supabase using dynamic filters:
+  - price range
+  - city
+  - property type
+  - bedrooms
+
+### 5. Response Generation
+- Top 3 results are formatted into a natural conversational response
+
+---
+
+## ⚡ Advanced Features
+
+### 🔁 Tool Routing (AI Agent)
+The AI acts as a router:
+- Property queries → Supabase
+- Weather queries → Weather API
+
+### ⚡ Caching Layer
+- Results cached by city name
+- Prevents repeated DB queries for same location
+- Improves performance and response time
+
+---
+
+## 🧪 Test Scenario (Fragmented Lead)
+
+| Step | User Input | System Behavior |
+|------|-----------|-----------------|
+| 1 | "I'm looking for an Apartment" | Sets `property_type` |
+| 2 | "I want to live in New York" | Sets `city`, triggers search |
+| 3 | "What’s the weather there?" | Calls Weather API (keeps state) |
+| 4 | "Budget is 2000–4000" | Updates price range, refines results |
+| 5 | "Show me Studios instead" | Updates property type, re-triggers search |
+
+---
+
+## 📦 Tech Stack
+
+- n8n (Workflow Automation)
+- Supabase (Database)
+- OpenAI / AI Agent (Intent Extraction)
+- Weather API
+- Custom Caching Logic
+
+---
+
+## 📌 Project Status
+
+🚧 Prototype / In Development  
+Focused on building real-world AI workflow automation systems.
+
+---
+
+## 👨‍💻 Author
+
+**Imran Shafique**  
+
+---
